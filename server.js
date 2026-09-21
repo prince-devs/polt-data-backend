@@ -128,14 +128,43 @@ async function safeFetchJson(url, options, attempt = 1) {
 const datahub = {
   verify: (networkKey, recipient, isPortedNumber = true) => throttles.verify.run(() =>
     safeFetchJson(`${DATAHUB_BASE_URL}/verify`, { method: 'POST', body: JSON.stringify({ networkKey, recipient, is_ported_number: isPortedNumber }) })),
+  submitBeneficiaries: (numbers) => throttles.beneficiaries.run(() =>
+    safeFetchJson(`${DATAHUB_BASE_URL}/beneficiaries`, { method: 'POST', body: JSON.stringify({ numbers: Array.isArray(numbers) ? numbers : [numbers] }) })),
   purchase: (networkKey, recipient, capacity) => throttles.purchase.run(() =>
     safeFetchJson(`${DATAHUB_BASE_URL}/data-purchase`, { method: 'POST', body: JSON.stringify({ networkKey, recipient, capacity: String(capacity) }) })),
   MTN_NETWORKS: new Set(['YELLO', 'mtn_xpress']),
 };
-// NOTE: DataHub's own /beneficiaries submission path for unverified numbers is
-// intentionally not used any more — it can take weeks to months to resolve.
-// Unverified MTN numbers are now routed to DataBossHub's "MTN Unverified"
-// product instead (see below), which resolves in a few days.
+
+// A number only ever needs to be submitted to DataHub's beneficiary queue once.
+// This tracks that per phone number in Firebase so repeat orders (or repeat
+// manual "submit for verification" clicks) don't resubmit endlessly.
+// Fire-and-forget by design — DataHub's own approval can take weeks to months,
+// so this never blocks order creation or delivery; DataBossHub handles the
+// actual delivery in the meantime (see attemptDataBossPurchase below). Once
+// DataHub eventually approves the number on its own, future orders for it will
+// naturally route back to the cheaper/faster DataHub path via the /verify check.
+async function submitToDataHubInBackground(phone) {
+  try {
+    const path = `datahub_verification_submissions/${phone}`;
+    const existing = await fb.get(path);
+    if (existing) return existing; // already submitted successfully before — don't resubmit
+
+    const res = await datahub.submitBeneficiaries([phone]);
+    const record = {
+      phone,
+      submitted: !!res.success,
+      response: res.error || res.message || null,
+      submitted_at: new Date().toISOString(),
+    };
+    // Only cache on success — a failed attempt (rate limit, transient error,
+    // etc.) should be retried on the next order or button click, not stuck.
+    if (record.submitted) await fb.set(path, record);
+    return record;
+  } catch (err) {
+    console.error('[datahub submission] error:', err.message);
+    return { phone, submitted: false, response: err.message };
+  }
+}
 
 // ══════════════════════════════════════════════════════════════
 // DATABOSSHUB CLIENT — fallback provider for MTN numbers DataHub can't verify.
@@ -278,6 +307,11 @@ async function routeOrder(order) {
 
   const verifyRes = await datahub.verify(order.network, order.recipient, true);
   if (verifyRes.success && verifyRes.data?.exists) return attemptDataHubPurchase(order);
+
+  // Unverified: fire off the DataHub beneficiary submission in the background
+  // (so the number eventually becomes properly verified there too — cheaper,
+  // for future orders) while delivering THIS order via DataBossHub right now.
+  submitToDataHubInBackground(order.recipient).catch((err) => console.error('[datahub submission] unexpected error:', err.message));
   return attemptDataBossPurchase(order);
 }
 
@@ -472,7 +506,7 @@ app.post('/payment/verify', async (req, res) => {
 
   let message;
   if (order.status === 'FAILED') message = 'Your payment was received, but we could not place your order. Please contact support.';
-  else if (order.status === 'AWAITING_VERIFICATION') message = 'Your number is new to our network and is being verified. This usually takes a few minutes — we will update your order automatically.';
+  else if (order.fulfillment_provider === 'databosshub') message = 'Your number is new, so it needs to go through network verification first. This takes up to 2–3 working days, and your data will be delivered automatically as soon as verification is complete — no action needed from you.';
   else message = 'Order placed successfully! Data will be delivered shortly.';
 
   res.json({ success: order.status !== 'FAILED', data: { ...order, order_status: order.status, order_reference: order.reference, message } });
@@ -498,14 +532,49 @@ app.get('/order/whatsapp-link/:reference', async (req, res) => {
   res.json({ success: true, whatsapp_link: link, order: { reference: order.reference, status: order.status } });
 });
 
+// Lets customers check up front whether their number is already verified
+// (fast DataHub delivery) or new (routed through the slower backup path).
 app.get('/check-number-status/:phone', async (req, res) => {
   const phone = req.params.phone;
   if (!isValidGhPhone(phone)) return res.json({ success: false, error: 'Invalid phone number' });
-  const priorOrders = await fb.findAllBy('orders', 'recipient', phone);
-  if (priorOrders.some((o) => ['SUCCESSFUL', 'PROCESSING'].includes(o.status))) return res.json({ success: true, isRegistered: true, message: 'Number is registered and verified' });
+
   const verifyRes = await datahub.verify('YELLO', phone, true);
   const verified = !!(verifyRes.success && verifyRes.data?.exists);
-  res.json({ success: true, isRegistered: verified, message: verified ? 'Number is registered and verified — fast delivery' : 'New number — delivery may take a little longer (up to a few days) via our backup provider' });
+  const submission = await fb.get(`datahub_verification_submissions/${phone}`);
+
+  res.json({
+    success: true,
+    isRegistered: verified,
+    alreadySubmitted: !!submission,
+    message: verified
+      ? 'This number is verified — data is delivered within minutes.'
+      : 'This is a new number. Buying data now still works — delivery just takes up to 2–3 working days while verification completes.',
+  });
+});
+
+// Lets a customer proactively submit their number to DataHub's verification
+// queue before (or without) buying anything — so it's already in progress by
+// the time they do place an order. Purely a head start; purchases for
+// unverified numbers work immediately regardless, via the backup provider.
+app.post('/submit-for-verification', async (req, res) => {
+  const phone = req.body.phone;
+  if (!isValidGhPhone(phone)) return res.json({ success: false, error: 'Enter a valid 10-digit phone number starting with 0' });
+
+  const verifyRes = await datahub.verify('YELLO', phone, true);
+  if (verifyRes.success && verifyRes.data?.exists) {
+    return res.json({ success: true, alreadyVerified: true, message: 'This number is already verified — nothing to submit.' });
+  }
+
+  const record = await submitToDataHubInBackground(phone);
+  if (!record.submitted) {
+    return res.json({ success: false, error: record.response || 'Could not submit this number right now. Please try again later.' });
+  }
+
+  res.json({
+    success: true,
+    alreadySubmitted: true,
+    message: 'Submitted for network verification. This typically takes 2–3 working days. You can still buy data on this number right away — it will just be delivered once verification completes.',
+  });
 });
 
 // ── Admin (you — there's no reseller layer in v1, just one owner) ──
