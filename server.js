@@ -417,6 +417,10 @@ async function pollDataBossOrders() {
 // EXPRESS APP
 // ══════════════════════════════════════════════════════════════
 const app = express();
+// Render (and most PaaS hosts) sit behind a reverse proxy, so Express needs to
+// be told to trust the X-Forwarded-For header it sets — without this,
+// express-rate-limit throws ERR_ERL_UNEXPECTED_X_FORWARDED_FOR on every request.
+app.set('trust proxy', 1);
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(cors({ origin: PORTAL_URL, credentials: true }));
 app.use('/webhook/paystack', express.raw({ type: 'application/json' })); // needs raw body for signature check
