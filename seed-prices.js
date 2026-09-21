@@ -36,12 +36,23 @@ const db = admin.database();
 // `size` is the bundle's key (also what gets sent to DataHub as `capacity`),
 // so keep it as the plain GB number as a string, e.g. "1", "2", "5", "10".
 
+// ⚠️ PRICING NOTE — MTN specifically:
+// Every MTN order silently routes to whichever provider can fulfill it (see
+// server.js routeOrder): DataHub for verified numbers (cheaper), DataBossHub's
+// "MTN Unverified" product for unverified ones (pricier, ~4.40–43.00 GHS
+// depending on size at time of writing). The customer sees ONE price either
+// way, so MTN prices below are set with enough margin to stay profitable even
+// in the worst case (DataBossHub fulfilling it) — don't price MTN bundles
+// against DataHub's cheaper cost alone, or every silently-routed DataBossHub
+// order quietly loses money. Telecel/AirtelTigo aren't affected — they only
+// ever use DataHub, so no dual-provider margin concern there.
+
 const BUNDLES = [
   // network       size   price(GHS)  capacityLabel  validity
-  ['mtn',        '1',   6.00,  '1GB',  '30 days'],
-  ['mtn',        '2',   11.50, '2GB',  '30 days'],
-  ['mtn',        '5',   26.00, '5GB',  '30 days'],
-  ['mtn',        '10',  49.00, '10GB', '30 days'],
+  ['mtn',        '1',   7.00,  '1GB',  '30 days'],   // DataBossHub cost ≈4.40
+  ['mtn',        '2',   13.00, '2GB',  '30 days'],   // DataBossHub cost ≈8.70
+  ['mtn',        '5',   28.50, '5GB',  '30 days'],   // DataBossHub cost ≈22.50
+  ['mtn',        '10',  52.00, '10GB', '30 days'],   // DataBossHub cost ≈43.00
 
   ['telecel',    '1',   5.50,  '1GB',  '30 days'],
   ['telecel',    '5',   24.50, '5GB',  '30 days'],
