@@ -437,13 +437,29 @@ app.get('/health', (req, res) => res.json({ status: 'ok', service: 'byvox-backen
 
 // ── Public pricing / announcements ──
 
-app.get('/prices', async (req, res) => {
+// Simple in-memory cache for prices — this data barely changes (only when you
+// edit it in admin.html), so there's no reason to hit Firebase on every single
+// page load. Cache clears itself whenever prices are actually updated below.
+let pricesCache = null;
+let pricesCacheAt = 0;
+const PRICES_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+async function getPricesFresh() {
   const prices = (await fb.get('prices/customer')) || {};
   const result = [];
   Object.keys(prices).forEach((network) => Object.keys(prices[network] || {}).forEach((size) => {
     result.push({ network, size, price: prices[network][size].price, validity: prices[network][size].validity, capacity: prices[network][size].capacity });
   }));
-  res.json({ success: true, data: result });
+  return result;
+}
+
+app.get('/prices', async (req, res) => {
+  const now = Date.now();
+  if (!pricesCache || now - pricesCacheAt > PRICES_CACHE_TTL_MS) {
+    pricesCache = await getPricesFresh();
+    pricesCacheAt = now;
+  }
+  res.json({ success: true, data: pricesCache });
 });
 
 app.get('/announcements/active', async (req, res) => {
@@ -605,11 +621,13 @@ adminRouter.post('/prices', async (req, res) => {
   const updates = {};
   req.body.prices.forEach((p) => { updates[`prices/customer/${p.network}/${p.size}`] = { price: p.price, validity: p.validity, capacity: p.capacity }; });
   await db.ref().update(updates);
+  pricesCache = null; // force a fresh read on the next /prices request
   res.json({ success: true, message: 'Prices updated' });
 });
 
 adminRouter.post('/prices/delete', async (req, res) => {
   await fb.remove(`prices/customer/${req.body.network}/${req.body.size}`);
+  pricesCache = null;
   res.json({ success: true, message: 'Bundle removed' });
 });
 
