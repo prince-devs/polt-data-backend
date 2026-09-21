@@ -19,6 +19,8 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 const DATAHUB_API_KEY = process.env.DATAHUB_API_KEY;
 const DATAHUB_BASE_URL = process.env.DATAHUB_BASE_URL || 'https://app.datahubgh.com/api/external';
+const DATABOSSHUB_API_KEY = process.env.DATABOSSHUB_API_KEY;
+const DATABOSSHUB_BASE_URL = process.env.DATABOSSHUB_BASE_URL || 'https://bbhubportal.com/api/v1';
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
 
 // ══════════════════════════════════════════════════════════════
@@ -126,11 +128,49 @@ async function safeFetchJson(url, options, attempt = 1) {
 const datahub = {
   verify: (networkKey, recipient, isPortedNumber = true) => throttles.verify.run(() =>
     safeFetchJson(`${DATAHUB_BASE_URL}/verify`, { method: 'POST', body: JSON.stringify({ networkKey, recipient, is_ported_number: isPortedNumber }) })),
-  submitBeneficiaries: (numbers) => throttles.beneficiaries.run(() =>
-    safeFetchJson(`${DATAHUB_BASE_URL}/beneficiaries`, { method: 'POST', body: JSON.stringify({ numbers: Array.isArray(numbers) ? numbers : [numbers] }) })),
   purchase: (networkKey, recipient, capacity) => throttles.purchase.run(() =>
     safeFetchJson(`${DATAHUB_BASE_URL}/data-purchase`, { method: 'POST', body: JSON.stringify({ networkKey, recipient, capacity: String(capacity) }) })),
   MTN_NETWORKS: new Set(['YELLO', 'mtn_xpress']),
+};
+// NOTE: DataHub's own /beneficiaries submission path for unverified numbers is
+// intentionally not used any more — it can take weeks to months to resolve.
+// Unverified MTN numbers are now routed to DataBossHub's "MTN Unverified"
+// product instead (see below), which resolves in a few days.
+
+// ══════════════════════════════════════════════════════════════
+// DATABOSSHUB CLIENT — fallback provider for MTN numbers DataHub can't verify.
+// Response envelope is { status: "success"|"error", data: {...}, meta: {...} },
+// different shape from DataHub's { success, data }, so this client normalizes
+// it to the same { success, data, error } shape the rest of the app expects.
+// ══════════════════════════════════════════════════════════════
+async function safeDataBossFetch(url, options, attempt = 1) {
+  const maxAttempts = 3;
+  try {
+    const res = await fetch(url, { ...options, headers: { 'Content-Type': 'application/json', 'X-API-KEY': DATABOSSHUB_API_KEY, ...(options.headers || {}) } });
+    const contentType = res.headers.get('content-type') || '';
+    if (!contentType.includes('application/json')) {
+      const text = await res.text();
+      console.error(`[databosshub] non-JSON response (${res.status}) from ${url}: ${text.slice(0, 200)}`);
+      if (res.status >= 500 && attempt < maxAttempts) { await sleep(attempt * 1000); return safeDataBossFetch(url, options, attempt + 1); }
+      return { success: false, error: 'DataBossHub service is currently unavailable. Please try again later.' };
+    }
+    const json = await res.json();
+    if (json.status !== 'success') return { success: false, error: json.data?.message || 'DataBossHub rejected the request.', code: json.data?.code };
+    return { success: true, data: json.data };
+  } catch (err) {
+    console.error(`[databosshub] fetch error on ${url}:`, err.message);
+    if (attempt < maxAttempts) { await sleep(attempt * 1000); return safeDataBossFetch(url, options, attempt + 1); }
+    return { success: false, error: 'Service temporarily unavailable. Please try again later.' };
+  }
+}
+
+const databosshubThrottle = new Throttle(20); // no published limit — stay conservative
+
+const databosshub = {
+  placeOrder: (dataPlan, beneficiary) => databosshubThrottle.run(() =>
+    safeDataBossFetch(`${DATABOSSHUB_BASE_URL}/order`, { method: 'POST', body: JSON.stringify({ network: 'MTN Unverified', data_plan: dataPlan, beneficiary }) })),
+  checkOrderStatus: (reference) => databosshubThrottle.run(() =>
+    safeDataBossFetch(`${DATABOSSHUB_BASE_URL}/order-status?reference=${encodeURIComponent(reference)}`, { method: 'GET' })),
 };
 
 // ══════════════════════════════════════════════════════════════
@@ -175,17 +215,31 @@ function requireAdmin(req, res, next) {
 }
 
 // ══════════════════════════════════════════════════════════════
-// ORDER STATE MACHINE
+// ORDER STATE MACHINE — dual provider
 //
-// PENDING → AWAITING_VERIFICATION? → PROCESSING → SUCCESSFUL | FAILED
-//                                                 ↘ MANUAL_REVIEW (stuck > 6h)
+// PENDING → PROCESSING → SUCCESSFUL | FAILED
+//                       ↘ MANUAL_REVIEW (DataBossHub order stuck too long)
 //
-// MTN numbers must be verified (or submitted + approved) before DataHub will
-// accept a purchase. This is handled automatically — see routeOrder / the
-// verification poller at the bottom of this section.
+// Every MTN order is checked against DataHub's /verify on arrival:
+//   verified      → fulfilled by DataHub (fast, existing behavior, unchanged)
+//   NOT verified  → fulfilled by DataBossHub's "MTN Unverified" product instead
+//                    (a few days, not weeks — DataHub's own unverified/beneficiary
+//                    path is deprecated and no longer used at all)
+// A phone number that's ever been routed to DataBossHub naturally keeps routing
+// there on every future order too — we never submit it to DataHub's beneficiary
+// queue any more, so it will never become DataHub-verified on its own.
 // ══════════════════════════════════════════════════════════════
-const MAX_VERIFICATION_HOURS = 6;
-const VERIFICATION_POLL_MS = 2 * 60 * 1000;
+const DATABOSS_POLL_MS = 2 * 60 * 60 * 1000; // check pending DataBossHub orders every 2 hours
+const DATABOSS_MAX_DAYS = 7; // beyond this, flag for manual review instead of polling forever
+
+// DataHub bundle size (e.g. "1", "2", "5", "10") → DataBossHub's plan_name format ("1 GB").
+// Extend this if you add bundle sizes DataBossHub doesn't offer under MTN Unverified
+// (1,2,3,4,5,10,20,25,30 GB at time of writing) — an order for a size with no mapping
+// here will fail cleanly with a clear error instead of silently sending a bad request.
+const DATABOSS_MTN_PLAN_MAP = {
+  '1': '1 GB', '2': '2 GB', '3': '3 GB', '4': '4 GB', '5': '5 GB',
+  '10': '10 GB', '20': '20 GB', '25': '25 GB', '30': '30 GB',
+};
 
 async function createOrder(details) {
   const orderId = generateId();
@@ -197,6 +251,7 @@ async function createOrder(details) {
     reference,
     paystack_reference: details.paystackReference,
     datahub_reference: null,
+    fulfillment_provider: null, // 'datahub' | 'databosshub', set once routed
     network: details.network,
     bundle: details.bundle,
     capacity: details.capacity,
@@ -208,7 +263,6 @@ async function createOrder(details) {
     profit: 0,
     status: 'PENDING',
     is_new_number: false,
-    verification_attempts: 0,
     whatsapp_link: null,
     created_at: new Date().toISOString(),
     updated_at: new Date().toISOString(),
@@ -220,43 +274,18 @@ async function createOrder(details) {
 }
 
 async function routeOrder(order) {
-  if (!datahub.MTN_NETWORKS.has(order.network)) return attemptPurchase(order);
+  if (!datahub.MTN_NETWORKS.has(order.network)) return attemptDataHubPurchase(order);
 
   const verifyRes = await datahub.verify(order.network, order.recipient, true);
-  if (verifyRes.success && verifyRes.data?.exists) return attemptPurchase(order);
-  return enqueueForVerification(order);
+  if (verifyRes.success && verifyRes.data?.exists) return attemptDataHubPurchase(order);
+  return attemptDataBossPurchase(order);
 }
 
-async function enqueueForVerification(order) {
-  const phone = order.recipient;
-  const queuePath = `number_verification_queue/${phone}`;
-  const existing = await fb.get(queuePath);
-
-  if (existing) {
-    const orderIds = Array.from(new Set([...(existing.order_ids || []), order.id]));
-    await fb.update(queuePath, { order_ids: orderIds, updated_at: new Date().toISOString() });
-  } else {
-    const submitRes = await datahub.submitBeneficiaries([phone]);
-    await fb.set(queuePath, {
-      phone,
-      order_ids: [order.id],
-      submitted: !!submitRes.success,
-      submit_response: submitRes.error || submitRes.message || null,
-      attempts: 0,
-      created_at: new Date().toISOString(),
-      updated_at: new Date().toISOString(),
-      next_check_at: new Date(Date.now() + VERIFICATION_POLL_MS).toISOString(),
-    });
-  }
-
-  await fb.update(`orders/${order.id}`, { status: 'AWAITING_VERIFICATION', is_new_number: true, updated_at: new Date().toISOString() });
-}
-
-async function attemptPurchase(order) {
+async function attemptDataHubPurchase(order) {
   const res = await datahub.purchase(order.network, order.recipient, order.capacity);
 
   if (!res.success) {
-    await fb.update(`orders/${order.id}`, { status: 'FAILED', datahub_message: res.error || res.message || 'Purchase rejected', updated_at: new Date().toISOString() });
+    await fb.update(`orders/${order.id}`, { status: 'FAILED', fulfillment_provider: 'datahub', datahub_message: res.error || res.message || 'Purchase rejected', updated_at: new Date().toISOString() });
     return fb.get(`orders/${order.id}`);
   }
 
@@ -265,10 +294,43 @@ async function attemptPurchase(order) {
 
   await fb.update(`orders/${order.id}`, {
     status: 'PROCESSING',
+    fulfillment_provider: 'datahub',
     datahub_reference: res.data?.reference || null,
     datahub_status: res.data?.status || null,
     datahub_cost: datahubCost,
     profit: order.amount_paid - datahubCost,
+    whatsapp_link: link,
+    updated_at: new Date().toISOString(),
+  });
+
+  return fb.get(`orders/${order.id}`);
+}
+
+async function attemptDataBossPurchase(order) {
+  const plan = DATABOSS_MTN_PLAN_MAP[String(order.capacity)];
+  if (!plan) {
+    await fb.update(`orders/${order.id}`, { status: 'MANUAL_REVIEW', fulfillment_provider: 'databosshub', datahub_message: `No DataBossHub plan mapping for bundle size "${order.capacity}" — add it to DATABOSS_MTN_PLAN_MAP.`, updated_at: new Date().toISOString() });
+    return fb.get(`orders/${order.id}`);
+  }
+
+  const res = await databosshub.placeOrder(plan, order.recipient);
+
+  if (!res.success) {
+    await fb.update(`orders/${order.id}`, { status: 'FAILED', fulfillment_provider: 'databosshub', datahub_message: res.error || 'DataBossHub rejected the order', updated_at: new Date().toISOString() });
+    return fb.get(`orders/${order.id}`);
+  }
+
+  const link = whatsappLink(order.recipient, whatsappMessage(order.reference, order.bundle, order.network, order.amount_paid));
+
+  // Unverified-number orders take days, not minutes — is_new_number drives the
+  // "may take a few days" messaging on the frontend instead of fast-delivery copy.
+  await fb.update(`orders/${order.id}`, {
+    status: 'PROCESSING',
+    fulfillment_provider: 'databosshub',
+    is_new_number: true,
+    databoss_reference: res.data?.reference || null,
+    databoss_status: res.data?.status || null,
+    databoss_plan: plan,
     whatsapp_link: link,
     updated_at: new Date().toISOString(),
   });
@@ -284,36 +346,37 @@ async function applyStatusUpdate(orderId, newStatus, extra = {}) {
   return fb.get(`orders/${orderId}`);
 }
 
-async function pollVerificationQueue() {
+// Background poller for orders fulfilled by DataBossHub — these take days, so
+// this checks infrequently rather than the tight loop DataHub's flow used.
+async function pollDataBossOrders() {
   try {
-    const queue = (await fb.get('number_verification_queue')) || {};
+    const orders = (await fb.get('orders')) || {};
     const now = Date.now();
 
-    for (const [phone, entry] of Object.entries(queue)) {
-      const nextCheck = entry.next_check_at ? new Date(entry.next_check_at).getTime() : 0;
-      if (nextCheck > now) continue;
+    for (const [orderId, order] of Object.entries(orders)) {
+      if (order.fulfillment_provider !== 'databosshub' || order.status !== 'PROCESSING') continue;
+      if (!order.databoss_reference) continue;
 
-      const hoursWaiting = (now - new Date(entry.created_at).getTime()) / (1000 * 60 * 60);
-      if (hoursWaiting > MAX_VERIFICATION_HOURS) { await flushQueueEntry(phone, entry, 'MANUAL_REVIEW', 'Number was not approved by the network within the expected window.'); continue; }
+      const daysWaiting = (now - new Date(order.created_at).getTime()) / (1000 * 60 * 60 * 24);
+      if (daysWaiting > DATABOSS_MAX_DAYS) {
+        await applyStatusUpdate(orderId, 'MANUAL_REVIEW', { datahub_message: `DataBossHub order not resolved after ${DATABOSS_MAX_DAYS} days — check manually.` });
+        continue;
+      }
 
-      const verifyRes = await datahub.verify('YELLO', phone, true);
-      if (verifyRes.success && verifyRes.data?.exists) {
-        await flushQueueEntry(phone, entry, 'PURCHASE');
-      } else {
-        await fb.update(`number_verification_queue/${phone}`, { attempts: (entry.attempts || 0) + 1, updated_at: new Date().toISOString(), next_check_at: new Date(now + VERIFICATION_POLL_MS).toISOString() });
+      const statusRes = await databosshub.checkOrderStatus(order.databoss_reference);
+      if (!statusRes.success) continue; // transient error — try again next poll
+
+      const providerStatus = statusRes.data?.status;
+      if (providerStatus === 'completed') {
+        await applyStatusUpdate(orderId, 'SUCCESSFUL', { databoss_status: providerStatus });
+      } else if (providerStatus && !['pending_wallet', 'processing'].includes(providerStatus)) {
+        // Unrecognized status — don't guess success/failure, flag for a human.
+        await fb.update(`orders/${orderId}`, { databoss_status: providerStatus, status: 'MANUAL_REVIEW', datahub_message: `Unrecognized DataBossHub status "${providerStatus}" — check manually.`, updated_at: new Date().toISOString() });
+      } else if (providerStatus) {
+        await fb.update(`orders/${orderId}`, { databoss_status: providerStatus, updated_at: new Date().toISOString() });
       }
     }
-  } catch (err) { console.error('[verification poller] error:', err.message); }
-}
-
-async function flushQueueEntry(phone, entry, action, note) {
-  for (const orderId of entry.order_ids || []) {
-    const order = await fb.get(`orders/${orderId}`);
-    if (!order || order.status !== 'AWAITING_VERIFICATION') continue;
-    if (action === 'PURCHASE') await attemptPurchase(order);
-    else await fb.update(`orders/${orderId}`, { status: 'MANUAL_REVIEW', datahub_message: note, updated_at: new Date().toISOString() });
-  }
-  await fb.remove(`number_verification_queue/${phone}`);
+  } catch (err) { console.error('[databoss poller] error:', err.message); }
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -442,7 +505,7 @@ app.get('/check-number-status/:phone', async (req, res) => {
   if (priorOrders.some((o) => ['SUCCESSFUL', 'PROCESSING'].includes(o.status))) return res.json({ success: true, isRegistered: true, message: 'Number is registered and verified' });
   const verifyRes = await datahub.verify('YELLO', phone, true);
   const verified = !!(verifyRes.success && verifyRes.data?.exists);
-  res.json({ success: true, isRegistered: verified, message: verified ? 'Number is registered and verified' : 'New number — this will need a short verification step after payment' });
+  res.json({ success: true, isRegistered: verified, message: verified ? 'Number is registered and verified — fast delivery' : 'New number — delivery may take a little longer (up to a few days) via our backup provider' });
 });
 
 // ── Admin (you — there's no reseller layer in v1, just one owner) ──
@@ -481,7 +544,14 @@ adminRouter.post('/order/retry', async (req, res) => {
   const order = await fb.get(`orders/${req.body.order_id}`);
   if (!order) return res.json({ success: false, error: 'Order not found' });
   if (order.status === 'SUCCESSFUL') return res.json({ success: false, error: 'Order already successful' });
-  const result = await attemptPurchase(order);
+
+  // Retry through whichever provider it was already routed to; if it never
+  // got routed at all (e.g. it failed before that point), re-run full routing.
+  let result;
+  if (order.fulfillment_provider === 'databosshub') result = await attemptDataBossPurchase(order);
+  else if (order.fulfillment_provider === 'datahub') result = await attemptDataHubPurchase(order);
+  else result = await routeOrder(order);
+
   res.json({ success: result.status !== 'FAILED', order: result });
 });
 
@@ -564,8 +634,8 @@ app.use((err, req, res, next) => { console.error('[server] unhandled error:', er
 // ══════════════════════════════════════════════════════════════
 app.listen(PORT, () => {
   console.log(`Byvox backend (v1) running on port ${PORT}`);
-  setInterval(pollVerificationQueue, VERIFICATION_POLL_MS);
-  console.log(`Verification poller running every ${VERIFICATION_POLL_MS / 1000}s`);
+  setInterval(pollDataBossOrders, DATABOSS_POLL_MS);
+  console.log(`DataBossHub order poller running every ${DATABOSS_POLL_MS / 1000 / 60} minutes`);
 });
 
 if (BACKEND_URL) {
