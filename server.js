@@ -484,7 +484,9 @@ app.post('/payment/initialize', async (req, res) => {
   const totalToCharge = calculateTotalWithFee(priceData.price);
 
   const paystackRes = await paystack.initializeTransaction({
-    email: email || 'customer@byvoxdata.com',
+    // No email given? Use the recipient's number so each payment is easy to
+    // recognize in Paystack (e.g. 0241234567@gmail.com) instead of one generic address.
+    email: (email && email.trim()) || `${normalizePhone(recipient)}@gmail.com`,
     amountPesewas: Math.round(totalToCharge * 100),
     metadata: { purpose: 'data_purchase', network, bundle, capacity, recipient },
     callback_url: `${PORTAL_URL}/checkout.html?payment_status=success`,
