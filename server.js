@@ -311,7 +311,9 @@ async function routeOrder(order) {
   // Unverified: fire off the DataHub beneficiary submission in the background
   // (so the number eventually becomes properly verified there too — cheaper,
   // for future orders) while delivering THIS order via DataBossHub right now.
-  submitToDataHubInBackground(order.recipient).catch((err) => console.error('[datahub submission] unexpected error:', err.message));
+  // Awaited (not fire-and-forget): on serverless hosts like Vercel, work still
+  // running after the response is sent gets frozen. The function catches its own errors.
+  await submitToDataHubInBackground(order.recipient);
   return attemptDataBossPurchase(order);
 }
 
@@ -671,10 +673,13 @@ app.use('/admin', adminRouter);
 
 // ── Webhooks ──
 
-app.post('/webhook/datahub-status', (req, res) => {
-  // DataHub requires a 2xx within 10s — ack immediately, resolve async.
+app.post('/webhook/datahub-status', async (req, res) => {
+  // DataHub requires a 2xx within 10s. On serverless hosts work can't continue
+  // after the response, so we finish first (retries below are kept short to fit
+  // that window) and always answer 200 so DataHub doesn't keep re-sending.
+  try { await handleDatahubWebhook(req.body); }
+  catch (err) { console.error('[webhook] datahub handler error:', err.message); }
   res.status(200).json({ received: true });
-  handleDatahubWebhook(req.body).catch((err) => console.error('[webhook] datahub handler error:', err.message));
 });
 
 const DATAHUB_STATUS_MAP = { SUCCESSFUL: 'SUCCESSFUL', FAILED: 'FAILED', PROCESSING: 'PROCESSING', PENDING: 'PROCESSING', INITIATED: 'PROCESSING', CANCELLED: 'FAILED' };
@@ -685,11 +690,11 @@ async function handleDatahubWebhook(body) {
   console.log(`[webhook] datahub event received: ${data.status} for ${data.reference}`);
 
   let orderKey = null;
-  for (let attempt = 1; attempt <= 5; attempt++) {
+  for (let attempt = 1; attempt <= 3; attempt++) {
     let [key] = await fb.findOneBy('orders', 'datahub_reference', data.reference);
     if (!key) [key] = await fb.findOneBy('orders', 'reference', data.reference);
     if (key) { orderKey = key; break; }
-    await sleep(Math.min(2000 * attempt, 15000));
+    if (attempt < 3) await sleep(1500 * attempt); // 1.5s then 3s — stays well under 10s
   }
 
   if (!orderKey) {
@@ -718,6 +723,19 @@ app.post('/webhook/paystack', async (req, res) => {
   } catch (err) { console.error('[webhook] paystack handler error:', err.message); }
 });
 
+// ── Scheduled job (replaces the setInterval poller, which can't run on serverless) ──
+// Hit this on a schedule (Vercel Cron and/or an external pinger like cron-job.org).
+// Protected by CRON_SECRET: send it as "Authorization: Bearer <secret>" (Vercel
+// Cron does this automatically) or as ?key=<secret>.
+app.get('/cron/poll-databoss', async (req, res) => {
+  const secret = process.env.CRON_SECRET;
+  if (!secret) return res.status(503).json({ success: false, error: 'CRON_SECRET is not configured' });
+  const provided = (req.headers.authorization || '').replace('Bearer ', '') || req.query.key;
+  if (provided !== secret) return res.status(401).json({ success: false, error: 'Unauthorized' });
+  await pollDataBossOrders();
+  res.json({ success: true, ran_at: new Date().toISOString() });
+});
+
 // ── 404 + error handlers ──
 app.use((req, res) => res.status(404).json({ success: false, error: 'Not found' }));
 app.use((err, req, res, next) => { console.error('[server] unhandled error:', err); res.status(500).json({ success: false, error: 'Service temporarily unavailable. Please try again.' }); });
@@ -725,15 +743,18 @@ app.use((err, req, res, next) => { console.error('[server] unhandled error:', er
 // ══════════════════════════════════════════════════════════════
 // START
 // ══════════════════════════════════════════════════════════════
-app.listen(PORT, () => {
-  console.log(`Byvox backend (v1) running on port ${PORT}`);
-  setInterval(pollDataBossOrders, DATABOSS_POLL_MS);
-  console.log(`DataBossHub order poller running every ${DATABOSS_POLL_MS / 1000 / 60} minutes`);
-});
+if (require.main === module) {
+  // Long-running host (Render, local): listen and run the poller in-process.
+  app.listen(PORT, () => {
+    console.log(`Byvox backend (v1) running on port ${PORT}`);
+    setInterval(pollDataBossOrders, DATABOSS_POLL_MS);
+    console.log(`DataBossHub order poller running every ${DATABOSS_POLL_MS / 1000 / 60} minutes`);
+  });
 
-if (BACKEND_URL) {
-  setInterval(() => { fetch(`${BACKEND_URL}/health`).catch(() => {}); }, 10 * 60 * 1000); // keep free-tier instance warm
+  if (BACKEND_URL) {
+    setInterval(() => { fetch(`${BACKEND_URL}/health`).catch(() => {}); }, 10 * 60 * 1000); // keep free-tier instance warm
+  }
 }
-// Add this to the very bottom of server.js
-module.exports = app;
 
+// Serverless host (Vercel) imports the app instead — see api/index.js.
+module.exports = app;
