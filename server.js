@@ -734,3 +734,6 @@ app.listen(PORT, () => {
 if (BACKEND_URL) {
   setInterval(() => { fetch(`${BACKEND_URL}/health`).catch(() => {}); }, 10 * 60 * 1000); // keep free-tier instance warm
 }
+// Add this to the very bottom of server.js
+module.exports = app;
+
