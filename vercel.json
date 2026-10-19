@@ -1,0 +1,5 @@
+{
+  "rewrites": [{ "source": "/(.*)", "destination": "/api" }],
+  "crons": [{ "path": "/cron/poll-databoss", "schedule": "0 6 * * *" }],
+  "functions": { "api/index.js": { "maxDuration": 30 } }
+}
