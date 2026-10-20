@@ -737,7 +737,7 @@ app.get('/cron/poll-databoss', async (req, res) => {
 });
 
 // ── 404 + error handlers ──
-app.use((req, res) => res.status(404).json({ success: false, error: 'Not found' }));
+app.use((req, res) => res.status(404).json({ success: false, error: 'Not found', path: req.originalUrl }));
 app.use((err, req, res, next) => { console.error('[server] unhandled error:', err); res.status(500).json({ success: false, error: 'Service temporarily unavailable. Please try again.' }); });
 
 // ══════════════════════════════════════════════════════════════
